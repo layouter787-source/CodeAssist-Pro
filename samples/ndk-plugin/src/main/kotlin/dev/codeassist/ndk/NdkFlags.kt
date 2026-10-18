@@ -1,6 +1,7 @@
 package dev.codeassist.ndk
 
 import java.nio.file.Path
+import java.nio.file.Paths
 
 /**
  * The flags a module's C and C++ are compiled with, in ONE place, because the editor and the build have to
@@ -13,19 +14,42 @@ import java.nio.file.Path
  */
 internal object NdkFlags {
 
-    /** What the editor asks clang with: everything that changes what PARSES, and nothing about codegen. */
-    fun editor(facet: NdkFacet, toolchain: NdkToolchain, cpp: Boolean): List<String> = buildList {
+    /**
+     * What the editor asks clang with: everything that changes what PARSES, and nothing about codegen.
+     *
+     * [moduleDir] resolves the facet's relative `includeDirs`. The build knows it; the editor's callers do not
+     * pass it, so it is looked up from the module directory diagnostics last [remember]ed for this facet.
+     */
+    fun editor(facet: NdkFacet, toolchain: NdkToolchain, cpp: Boolean, moduleDir: Path? = null): List<String> = buildList {
         add("-std=" + if (cpp) facet.cppStandard else facet.cStandard)
         // The glue is a header the module includes and a source it compiles, both from the packaged
         // directory: without this the editor cannot see the header the build compiles against.
         if (facet.nativeActivity) toolchain.nativeAppGlueDir?.let { add("-I$it") }
+        addAll(includeFlags(facet, moduleDir ?: moduleDirOf(facet)))
+        facet.defines.forEach { add("-D$it") }
         // Last, so a user's own flag wins over anything derived above.
         addAll(facet.compilerFlags)
     }
 
     /** What the build adds on top: position independence and the optimization level. */
-    fun build(facet: NdkFacet, toolchain: NdkToolchain, cpp: Boolean): List<String> =
-        listOf("-fPIC", facet.optimization) + editor(facet, toolchain, cpp)
+    fun build(facet: NdkFacet, toolchain: NdkToolchain, cpp: Boolean, moduleDir: Path? = null): List<String> =
+        listOf("-fPIC", facet.optimization) + editor(facet, toolchain, cpp, moduleDir)
+
+    /**
+     * `-I` for each of the facet's include directories. An absolute one is used as written; a relative one
+     * is resolved against the module, and DROPPED when there is no module to resolve it against, because a
+     * path resolved against whatever the working directory happens to be is a different header, not a
+     * missing one.
+     */
+    internal fun includeFlags(facet: NdkFacet, moduleDir: Path?): List<String> = facet.includeDirs.mapNotNull { dir ->
+        val p = runCatching { Paths.get(dir) }.getOrNull() ?: return@mapNotNull null
+        val resolved = when {
+            p.isAbsolute -> p
+            moduleDir != null -> moduleDir.resolve(p)
+            else -> return@mapNotNull null
+        }
+        "-I" + resolved.normalize()
+    }
 
     // -----------------------------------------------------------------------------------------------
     // Reaching the facet from a place the host does not hand a Module
@@ -58,5 +82,19 @@ internal object NdkFlags {
             .filter { path.startsWith(it.key + "/") }
             .maxByOrNull { it.key.length }
             ?.value
+    }
+
+    /**
+     * The directory of the module [facet] was remembered for.
+     *
+     * The very instance first (diagnostics hands the one it just remembered), then an equal one, which is how
+     * completion's freshly decoded copy finds it. When several modules share an identical facet the answer is
+     * ambiguous and is null: guessing would point `-I` at another module's headers.
+     */
+    @Synchronized
+    private fun moduleDirOf(facet: NdkFacet): Path? {
+        byModuleDir.entries.firstOrNull { it.value === facet }?.let { return runCatching { Paths.get(it.key) }.getOrNull() }
+        val equal = byModuleDir.entries.filter { it.value == facet }.map { it.key }.distinct()
+        return equal.singleOrNull()?.let { runCatching { Paths.get(it) }.getOrNull() }
     }
 }

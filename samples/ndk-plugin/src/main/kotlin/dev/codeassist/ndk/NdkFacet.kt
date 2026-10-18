@@ -13,6 +13,9 @@ import dev.ide.model.FacetKey
  *
  * Everything has a default that builds something sensible, so a module that names the facet and nothing else
  * still compiles `src/main/cpp` into a shared library for this device's ABI.
+ *
+ * A project that already has a CMakeLists.txt or an Android.mk does not have to be rewritten by hand:
+ * [NativeBuildImporter] reads those and produces this table.
  */
 data class NdkFacet(
     /** Directories holding the module's C and C++ sources, relative to the module. */
@@ -77,6 +80,21 @@ data class NdkFacet(
      * `android.app.lib_name`, so [libraryName] and that value are one setting in two files.
      */
     val nativeActivity: Boolean = false,
+
+    /**
+     * Header search directories, as `-I` takes them: relative to the module (`include`, `../shared/include`)
+     * or absolute. Written to the table only when set, so a module with none keeps the table it always had.
+     */
+    val includeDirs: List<String> = emptyList(),
+
+    /** Preprocessor definitions, as `-D` takes them without the flag: `NAME` or `NAME=value`. */
+    val defines: List<String> = emptyList(),
+
+    /**
+     * Compiles to run at once. `0` (the default) decides from the core count and the memory the device has
+     * left, which is what a phone wants: one job per core is how a build gets the whole app killed.
+     */
+    val jobs: Int = 0,
 ) : Facet {
     override val key get() = KEY
 
@@ -102,19 +120,24 @@ object NdkFacetCodec : FacetCodec<NdkFacet> {
     override val key = NdkFacet.KEY
     override val tomlTable = "ndk"
 
-    override fun encode(facet: NdkFacet): Map<String, Any?> = mapOf(
-        "sourceDirs" to facet.sourceDirs,
-        "libraryName" to facet.libraryName,
-        "abis" to facet.abis,
-        "minSdk" to facet.minSdk,
-        "cppStandard" to facet.cppStandard,
-        "cStandard" to facet.cStandard,
-        "stl" to facet.stl,
-        "optimization" to facet.optimization,
-        "compilerFlags" to facet.compilerFlags,
-        "linkLibraries" to facet.linkLibraries,
-        "nativeActivity" to facet.nativeActivity,
-    )
+    override fun encode(facet: NdkFacet): Map<String, Any?> = buildMap {
+        put("sourceDirs", facet.sourceDirs)
+        put("libraryName", facet.libraryName)
+        put("abis", facet.abis)
+        put("minSdk", facet.minSdk)
+        put("cppStandard", facet.cppStandard)
+        put("cStandard", facet.cStandard)
+        put("stl", facet.stl)
+        put("optimization", facet.optimization)
+        put("compilerFlags", facet.compilerFlags)
+        put("linkLibraries", facet.linkLibraries)
+        put("nativeActivity", facet.nativeActivity)
+        // The keys added later are written only when they say something, so every table written before they
+        // existed (and every template's) is byte for byte what it was.
+        if (facet.includeDirs.isNotEmpty()) put("includeDirs", facet.includeDirs)
+        if (facet.defines.isNotEmpty()) put("defines", facet.defines)
+        if (facet.jobs != 0) put("jobs", facet.jobs)
+    }
 
     override fun decode(values: Map<String, Any?>): NdkFacet {
         val defaults = NdkFacet()
@@ -130,6 +153,9 @@ object NdkFacetCodec : FacetCodec<NdkFacet> {
             compilerFlags = values.strings("compilerFlags", defaults.compilerFlags),
             linkLibraries = values.strings("linkLibraries", defaults.linkLibraries),
             nativeActivity = values.bool("nativeActivity", defaults.nativeActivity),
+            includeDirs = values.strings("includeDirs", defaults.includeDirs),
+            defines = values.strings("defines", defaults.defines),
+            jobs = values.int("jobs", defaults.jobs).coerceAtLeast(0),
         )
     }
 
