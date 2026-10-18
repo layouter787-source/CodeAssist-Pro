@@ -17,9 +17,17 @@ import dev.ide.build.TaskOutputsImpl
 import dev.ide.build.TaskResult
 import dev.ide.model.Module
 import dev.ide.platform.log.Logger
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.isActive
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.Paths
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 import java.util.stream.Collectors
 import kotlin.io.path.extension
 
@@ -97,12 +105,16 @@ class NdkBuildPlugin(
 
 /**
  * Compiles every source the facet names and links them into one shared library at
- * `<libDir>/<abi>/lib<name>.so`.
+ * `<libDir>/<abi>/lib<n>.so`.
  *
  * Incremental per source: each object keeps the dependency file clang wrote beside it, and a source is only
  * compiled again when it, or a header it included, is newer than its object, or when the flags changed.
  * Objects are named after the source's path inside the module, so two `util.cpp` in different directories
  * are two objects rather than one overwriting the other.
+ *
+ * The sources that need compiling are compiled IN PARALLEL, as many at once as the cores and the free memory
+ * allow (see [NdkResources]), and cancelling the build stops the compiles and the link that are running
+ * rather than waiting for them.
  */
 internal class NdkCompileTask(
     override val name: TaskName,
@@ -229,7 +241,7 @@ internal class NdkCompileTask(
     }
 
     /** Compile what changed and link one ABI; null on success, a failure result otherwise. */
-    private fun buildAbi(
+    private suspend fun buildAbi(
         ctx: TaskContext,
         toolchain: NdkToolchain,
         version: String,
@@ -247,8 +259,8 @@ internal class NdkCompileTask(
         // compiler's version is part of it: an updated plugin brings an updated clang.
         val compileStamp = buildString {
             appendLine(version)
-            appendLine(NdkFlags.build(facet, toolchain, cpp = true).joinToString(" "))
-            appendLine(NdkFlags.build(facet, toolchain, cpp = false).joinToString(" "))
+            appendLine(NdkFlags.build(facet, toolchain, cpp = true, moduleDir = moduleDir).joinToString(" "))
+            appendLine(NdkFlags.build(facet, toolchain, cpp = false, moduleDir = moduleDir).joinToString(" "))
         }
         val compileStampFile = objDir.resolve("compile.stamp")
         if (readStamp(compileStampFile) != compileStamp) deleteTree(objDir)
@@ -260,29 +272,7 @@ internal class NdkCompileTask(
             NativeIncremental.isStale(source, obj, depFileFor(obj))
         }
         if (stale.isNotEmpty()) {
-            ctx.logger()("ndk: compiling ${stale.size} of ${units.size} source(s) for $abi")
-        }
-        for ((index, unit) in stale.withIndex()) {
-            val (source, key) = unit
-            ctx.checkCanceled()
-            // A real fraction rather than indeterminate: a native build is the slow part of an Android build
-            // on a phone, and a bar that moves is the difference between waiting and wondering.
-            ctx.progress.report(index.toDouble() / (stale.size + 1), "Compiling ${source.fileName}")
-            val obj = objDir.resolve("$key.o")
-            val isCpp = source.extension.lowercase() != "c"
-            val compiled = toolchain.compile(
-                source, obj, cpp = isCpp,
-                extraFlags = NdkFlags.build(facet, toolchain, isCpp),
-                depFile = depFileFor(obj),
-            )
-            report(ctx, compiled.output, source)
-            if (!compiled.ok) {
-                // A failed compile can leave a partial object behind; without its dependency file the next
-                // build treats it as stale either way, but there is no reason to keep it.
-                runCatching { Files.deleteIfExists(obj); Files.deleteIfExists(depFileFor(obj)) }
-                ctx.logger()("ndk: failed to compile ${source.fileName}")
-                return TaskResult.Failed("ndk: ${source.fileName} did not compile")
-            }
+            compileStale(ctx, toolchain, stale, units.size, objDir, abi)?.let { return it }
         }
         writeStamp(compileStampFile, compileStamp)
         units.forEach { (_, key) -> objects.add(objDir.resolve("$key.o")) }
@@ -304,10 +294,20 @@ internal class NdkCompileTask(
         }
 
         ctx.progress.report(stale.size.toDouble() / (stale.size + 1), "Linking lib${facet.libraryName}.so")
-        val linked = toolchain.linkShared(objects, out, facet.linkLibraries, cpp = cpp, stl = facet.stl)
+        val linked = toolchain.linkShared(
+            objects, out, facet.linkLibraries, cpp = cpp, stl = facet.stl,
+            canceled = { isCanceled(ctx) },
+        )
         report(ctx, linked.output, null)
         if (!linked.ok) {
             runCatching { Files.deleteIfExists(linkStampFile) }
+            if (linked.canceled) {
+                // A link stopped part-way leaves a truncated library where the last good one was; remove it
+                // so nothing packages it, then let the cancellation unwind the build.
+                runCatching { Files.deleteIfExists(out) }
+                ctx.checkCanceled()
+                return TaskResult.Failed("ndk: the link of lib${facet.libraryName}.so was canceled")
+            }
             return TaskResult.Failed("ndk: lib${facet.libraryName}.so did not link")
         }
         packageCxxRuntime(ctx, toolchain, cpp, out)?.let { return it }
@@ -316,6 +316,98 @@ internal class NdkCompileTask(
         ctx.logger()("ndk: wrote ${out.fileName} (${runCatching { Files.size(out) }.getOrDefault(0L)} bytes) for $abi")
         return null
     }
+
+    /**
+     * Compile [stale] in parallel; null when all of them compiled, a failure otherwise.
+     *
+     * How many at once comes from [NdkResources.planJobs] (the `jobs` key, or the cores held down by free
+     * memory), and [CompileScheduler] backs off to a single job while the device is short of memory. The first
+     * failure stops the compiles still running, because a build that has already failed gains nothing from
+     * finishing them; every failure that did complete has already been reported as a diagnostic.
+     */
+    private suspend fun compileStale(
+        ctx: TaskContext,
+        toolchain: NdkToolchain,
+        stale: List<Pair<Path, String>>,
+        total: Int,
+        objDir: Path,
+        abi: String,
+    ): TaskResult? = coroutineScope {
+        val jobs = minOf(
+            stale.size,
+            NdkResources.planJobs(Runtime.getRuntime().availableProcessors(), NdkResources.readMemory()?.availableKb, facet.jobs),
+        ).coerceAtLeast(1)
+        val scheduler = CompileScheduler(jobs) { NdkResources.readMemory() }
+        ctx.logger()("ndk: compiling ${stale.size} of $total source(s) for $abi, $jobs at a time")
+
+        // The compiler's own output, the log and the progress bar are shared by every worker.
+        val lock = Any()
+        val finished = AtomicInteger(0)
+        val failure = AtomicReference<TaskResult?>(null)
+
+        val workers = stale.map { (source, key) ->
+            async(Dispatchers.IO) {
+                val self = currentCoroutineContext()
+                val stopped = { failure.get() != null || !self.isActive || isCanceled(ctx) }
+                try {
+                    scheduler.run {
+                        if (stopped()) return@run
+                        val obj = objDir.resolve("$key.o")
+                        val isCpp = source.extension.lowercase() != "c"
+                        val compiled = toolchain.compile(
+                            source, obj, cpp = isCpp,
+                            extraFlags = NdkFlags.build(facet, toolchain, isCpp, moduleDir),
+                            depFile = depFileFor(obj),
+                            canceled = stopped,
+                        )
+                        if (compiled.canceled) {
+                            // Stopped part-way: the object is partial, and without its dependency file the next
+                            // build treats it as stale either way, but there is no reason to keep it.
+                            runCatching { Files.deleteIfExists(obj); Files.deleteIfExists(depFileFor(obj)) }
+                            return@run
+                        }
+                        synchronized(lock) {
+                            report(ctx, compiled.output, source)
+                            // A real fraction rather than indeterminate: a native build is the slow part of an
+                            // Android build on a phone, and a bar that moves is the difference between waiting
+                            // and wondering.
+                            ctx.progress.report(
+                                finished.incrementAndGet().toDouble() / (stale.size + 1),
+                                "Compiling ${source.fileName}",
+                            )
+                        }
+                        if (!compiled.ok) {
+                            // A failed compile can leave a partial object behind; there is no reason to keep it.
+                            runCatching { Files.deleteIfExists(obj); Files.deleteIfExists(depFileFor(obj)) }
+                            synchronized(lock) { ctx.logger()("ndk: failed to compile ${source.fileName}") }
+                            failure.compareAndSet(null, TaskResult.Failed("ndk: ${source.fileName} did not compile"))
+                        }
+                    }
+                } catch (e: NdkLowMemoryException) {
+                    failure.compareAndSet(
+                        null,
+                        TaskResult.Failed(
+                            "ndk: not enough memory to compile — ${e.message}. Close other apps, or set `jobs = 1` in [ndk].",
+                        ),
+                    )
+                }
+                Unit
+            }
+        }
+        workers.awaitAll()
+        // A cancelled build reaches here with every compile killed; this is where it unwinds.
+        ctx.checkCanceled()
+        failure.get()
+    }
+
+    /** True when the build has been cancelled; the cancellation itself is raised by `checkCanceled`. */
+    private fun isCanceled(ctx: TaskContext): Boolean =
+        try {
+            ctx.checkCanceled()
+            false
+        } catch (e: Throwable) {
+            true
+        }
 
     /**
      * Put `libc++_shared.so` beside the library when it links against it, since the APK must carry it and
