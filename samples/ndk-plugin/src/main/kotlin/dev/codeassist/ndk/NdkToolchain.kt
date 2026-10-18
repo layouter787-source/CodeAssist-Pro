@@ -8,7 +8,6 @@ import java.io.InputStream
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.StandardCopyOption
-import java.util.concurrent.TimeUnit
 import java.util.zip.ZipInputStream
 import kotlin.io.path.exists
 import kotlin.io.path.readText
@@ -169,8 +168,11 @@ class NdkToolchain(
     val sharedCxxRuntime: Path?
         get() = root.resolve("sysroot/usr/lib/aarch64-linux-android/libc++_shared.so").takeIf { Files.isRegularFile(it) }
 
-    /** What a tool printed, and whether it succeeded. */
-    data class ToolResult(val ok: Boolean, val output: String)
+    /**
+     * What a tool printed, and whether it succeeded. [canceled] is true when it was stopped because the
+     * caller asked it to, which is neither a success nor a failure of the code being compiled.
+     */
+    data class ToolResult(val ok: Boolean, val output: String, val canceled: Boolean = false)
 
     /**
      * Compile [source] to [output]. [cpp] selects the C++ driver, which is `--driver-mode=g++` rather than a
@@ -178,6 +180,9 @@ class NdkToolchain(
      *
      * With a [depFile], clang also writes every header the source opened into it (`-MD -MF`), as a by-product
      * of the same compile, which is what lets the next build skip this source until one of them changes.
+     *
+     * [canceled] is polled while the compiler runs; when it turns true the process and its children are
+     * killed and the result says so.
      */
     fun compile(
         source: Path,
@@ -185,6 +190,7 @@ class NdkToolchain(
         cpp: Boolean,
         extraFlags: List<String> = emptyList(),
         depFile: Path? = null,
+        canceled: () -> Boolean = { false },
     ): ToolResult {
         val driver = driver ?: return ToolResult(false, "no compiler for this device's ABI")
         Files.createDirectories(output.parent)
@@ -197,7 +203,8 @@ class NdkToolchain(
                 if (depFile != null) { add("-MD"); add("-MF"); add(depFile.toString()) }
                 add("-c"); add(source.toString())
                 add("-o"); add(output.toString())
-            }
+            },
+            canceled = canceled,
         )
     }
 
@@ -289,6 +296,8 @@ class NdkToolchain(
      * `System.loadLibrary` with "cannot locate symbol", because nothing provided `std::` or `operator new`.
      * `--no-undefined` is the guard against that whole class: an unresolved symbol is a link error here, with
      * its name, instead of a crash on the device.
+     *
+     * [canceled] is polled while the linker runs; the driver and the lld it started are both stopped.
      */
     fun linkShared(
         objects: List<Path>,
@@ -296,6 +305,7 @@ class NdkToolchain(
         libs: List<String> = emptyList(),
         cpp: Boolean = false,
         stl: String = "c++_static",
+        canceled: () -> Boolean = { false },
     ): ToolResult {
         val driver = driver ?: return ToolResult(false, "no compiler for this device's ABI")
         val linker = linker ?: return ToolResult(false, "no linker for this device's ABI")
@@ -322,7 +332,8 @@ class NdkToolchain(
                 objects.forEach { add(it.toString()) }
                 libs.forEach { add("-l$it") }
                 add("-o"); add(output.toString())
-            }
+            },
+            canceled = canceled,
         )
     }
 
@@ -357,39 +368,38 @@ class NdkToolchain(
         "--sysroot", root.resolve("sysroot").toString(),
     )
 
+    /**
+     * Run a tool and collect what it prints.
+     *
+     * Delegates to [NdkProcess], which drains the output on its own thread so the deadline and [canceled]
+     * are honoured while the tool is still running. Before, the output was read to its end first, so the
+     * timeout only applied to a process that had already finished and a cancelled build waited out the
+     * compile in progress.
+     */
     private fun run(
         command: List<String>,
         timeoutSeconds: Long = 120,
         stdin: String? = null,
         workingDir: Path? = null,
+        canceled: () -> Boolean = { false },
     ): ToolResult {
         val libDir = driver?.parent ?: return ToolResult(false, "no toolchain")
         return try {
-            val process = ProcessBuilder(command)
-                .redirectErrorStream(true)
-                .apply {
-                    workingDir?.let { if (Files.isDirectory(it)) directory(it.toFile()) }
-                    // The child is a child of the IDE's process, so it does not inherit the plugin package's
-                    // own library search path; without this it cannot find libLLVM.so beside it.
-                    environment()["LD_LIBRARY_PATH"] = libDir.toString()
-                }
-                .start()
-
-            // Write the buffer and CLOSE, before reading a byte back. The other order deadlocks as soon as
-            // the input is larger than the pipe buffer: the compiler blocks writing diagnostics that nobody
-            // is draining, while we block writing source that it is not reading.
-            if (stdin != null) {
-                runCatching { process.outputStream.use { it.write(stdin.toByteArray()) } }
-            } else {
-                runCatching { process.outputStream.close() }
+            val r = NdkProcess.run(
+                command = command,
+                // The child is a child of the IDE's process, so it does not inherit the plugin package's
+                // own library search path; without this it cannot find libLLVM.so beside it.
+                env = mapOf("LD_LIBRARY_PATH" to libDir.toString()),
+                workingDir = workingDir?.toFile(),
+                stdin = stdin,
+                timeoutMillis = timeoutSeconds * 1000,
+                canceled = canceled,
+            )
+            when {
+                r.canceled -> ToolResult(false, "canceled", canceled = true)
+                r.timedOut -> ToolResult(false, "timed out after ${timeoutSeconds}s\n${r.output}")
+                else -> ToolResult(r.exit == 0, r.output.trim())
             }
-
-            val output = process.inputStream.bufferedReader().readText()
-            if (!process.waitFor(timeoutSeconds, TimeUnit.SECONDS)) {
-                process.destroyForcibly()
-                return ToolResult(false, "timed out after ${timeoutSeconds}s\n$output")
-            }
-            ToolResult(process.exitValue() == 0, output.trim())
         } catch (t: Throwable) {
             log.warn("could not run ${command.firstOrNull()}", t)
             ToolResult(false, t.message ?: t.toString())
