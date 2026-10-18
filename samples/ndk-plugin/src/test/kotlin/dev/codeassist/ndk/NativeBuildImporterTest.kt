@@ -15,6 +15,9 @@ private class MapFs(files: Map<String, String>) : ImportFs {
         files.keys.filter { it.startsWith(dir.normalize()) }.sortedBy { it.toString() }
 }
 
+/** `$` for the scripts below: a raw string has no escape for it, and `\${NAME}` would be interpolated. */
+private const val D = "$"
+
 class NativeBuildImporterTest {
 
     private fun import(files: Map<String, String>, module: String = "/m"): NativeImport =
@@ -32,9 +35,9 @@ class NativeBuildImporterTest {
                         cmake_minimum_required(VERSION 3.22.1)
                         project("native-lib")
                         set(CMAKE_CXX_STANDARD 20)
-                        add_library(\${CMAKE_PROJECT_NAME} SHARED native-lib.cpp util/helper.cpp)
+                        add_library(${D}{CMAKE_PROJECT_NAME} SHARED native-lib.cpp util/helper.cpp)
                         find_library(log-lib log)
-                        target_link_libraries(\${CMAKE_PROJECT_NAME} android \${log-lib})
+                        target_link_libraries(${D}{CMAKE_PROJECT_NAME} android ${D}{log-lib})
                     """.trimIndent(),
                     "/m/src/main/cpp/native-lib.cpp" to "",
                     "/m/src/main/cpp/util/helper.cpp" to "",
@@ -55,8 +58,8 @@ class NativeBuildImporterTest {
                 mapOf(
                     "/m/CMakeLists.txt" to """
                         project(game)
-                        file(GLOB_RECURSE SRC \${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp)
-                        add_library(game SHARED \${SRC})
+                        file(GLOB_RECURSE SRC ${D}{CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp)
+                        add_library(game SHARED ${D}{SRC})
                         target_include_directories(game PRIVATE include)
                         target_compile_definitions(game PRIVATE USE_GL=1 NDEBUG)
                         target_link_libraries(game GLESv3 EGL)
@@ -149,7 +152,7 @@ class NativeBuildImporterTest {
                 mapOf(
                     "/m/CMakeLists.txt" to """
                         project(game)
-                        add_library(native_app_glue STATIC \${ANDROID_NDK}/sources/android/native_app_glue/android_native_app_glue.c)
+                        add_library(native_app_glue STATIC ${D}{ANDROID_NDK}/sources/android/native_app_glue/android_native_app_glue.c)
                         add_library(game SHARED src/game.cpp)
                         target_link_libraries(game native_app_glue android log)
                     """.trimIndent(),
@@ -194,15 +197,15 @@ class NativeBuildImporterTest {
             import(
                 mapOf(
                     "/m/jni/Android.mk" to """
-                        LOCAL_PATH := \$(call my-dir)
-                        include \$(CLEAR_VARS)
+                        LOCAL_PATH := $(call my-dir)
+                        include $(CLEAR_VARS)
                         LOCAL_MODULE := native-lib
                         LOCAL_SRC_FILES := native-lib.cpp \
                             util.cpp
-                        LOCAL_C_INCLUDES += \$(LOCAL_PATH)/include
+                        LOCAL_C_INCLUDES += $(LOCAL_PATH)/include
                         LOCAL_CFLAGS := -DFOO=1 -O3
                         LOCAL_LDLIBS := -llog -landroid
-                        include \$(BUILD_SHARED_LIBRARY)
+                        include $(BUILD_SHARED_LIBRARY)
                     """.trimIndent(),
                     "/m/jni/Application.mk" to "APP_STL := c++_shared\nAPP_PLATFORM := android-28\n",
                     "/m/jni/native-lib.cpp" to "",
