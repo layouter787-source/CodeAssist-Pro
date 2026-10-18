@@ -92,6 +92,9 @@ class NdkPlugin : Plugin {
         if (HostSupport.spi31) JniDeclarations.register(reg)
 
         reg.register(UI_ACTION_EP, NdkModuleActions.addCpp(log))
+        // A project that already builds its C/C++ with CMake or ndk-build does not have to be rewritten by
+        // hand: this reads the script and writes the equivalent [ndk] table.
+        reg.register(UI_ACTION_EP, NdkImportAction.importBuild(log))
         NdkModuleActions.legacyNewFileActions().forEach { reg.register(UI_ACTION_EP, it) }
 
         // The command that makes the toolchain real to the user: it prepares it (unpacking on first run,
